@@ -18,18 +18,28 @@
 # log. --remote-port (default 7341) is the daemon's port on HOST: loopback ports
 # are shared by every user of a machine, so pick another one there if it is taken.
 # HOST is anything ssh accepts, including user@host and names from ~/.ssh/config.
+#
+# ~/.4coder-markers-remote.conf holds per-host defaults, one host per line, used
+# before the options given on the command line:
+#   user@server  --dir /shared/project/4coder-markers --remote-port 7342
 set -euo pipefail
 
 ME="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(dirname "$ME")"
 
 usage(){
-    sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,24p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     exit "${1:-1}"
 }
 
 [ $# -ge 2 ] || usage
 CMD="$1"; HOST="$2"; shift 2
+CONF="$HOME/.4coder-markers-remote.conf"
+if [ -f "$CONF" ]; then
+    defaults="$(awk -v h="$HOST" '$1 == h { $1 = ""; print; exit }' "$CONF")"
+    # shellcheck disable=SC2086
+    [ -n "$defaults" ] && set -- $defaults "$@"
+fi
 DIR='~/.4coder-markers'
 STATE='~/.4coder-markers'
 LOCAL_PORT=7341
