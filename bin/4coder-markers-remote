@@ -84,9 +84,13 @@ source_hash(){
 }
 
 version(){
-    local v
-    v="$(git -C "$ROOT" describe --always --dirty 2>/dev/null || true)"
-    if [ -z "$v" ] && [ -f "$ROOT/VERSION" ]; then v="$(cat "$ROOT/VERSION")"; fi
+    local v=""
+    # NOTE: a copy without its own git (e.g. next to the 4coder binary) carries a VERSION file
+    if [ -f "$ROOT/VERSION" ]; then
+        v="$(cat "$ROOT/VERSION")"
+    elif [ "$(git -C "$ROOT" rev-parse --show-toplevel 2>/dev/null)" = "$(cd "$ROOT" && pwd -P)" ]; then
+        v="$(git -C "$ROOT" describe --always --dirty 2>/dev/null || true)"
+    fi
     echo "${v:-src}+$(source_hash)"
 }
 
