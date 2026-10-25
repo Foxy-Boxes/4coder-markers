@@ -1,0 +1,170 @@
+#!/bin/bash
+# 4coder-markers-remote: install and update the 4coder-markers daemon on a remote
+# server over ssh, and forward a local port to it so 4coder sees what agents on
+# that server post.
+#
+#   4coder-markers-remote deploy HOST [--dir DIR]
+#       copy the sources to HOST, build there if they changed, and (re)start the
+#       daemon. Running it again is how a server is kept up to date.
+#   4coder-markers-remote connect HOST [--dir DIR] [--local-port P] [--remote-port P] [--no-deploy]
+#       deploy, then forward 127.0.0.1:P (default 7341) here to the daemon there
+#   4coder-markers-remote disconnect HOST [--local-port P]
+#   4coder-markers-remote status HOST [--dir DIR] [--local-port P]
+#   4coder-markers-remote stop HOST [--dir DIR]
+#
+# DIR (default ~/.4coder-markers, on HOST) holds the binary, sources, README.md,
+# AGENT_PROMPT.md, and the daemon's store, pid and log. HOST is anything ssh
+# accepts, including user@host and names from ~/.ssh/config.
+set -euo pipefail
+
+ME="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(dirname "$ME")"
+
+usage(){
+    sed -n '2,17p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    exit "${1:-1}"
+}
+
+[ $# -ge 2 ] || usage
+CMD="$1"; HOST="$2"; shift 2
+DIR='~/.4coder-markers'
+LOCAL_PORT=7341
+REMOTE_PORT=7341
+DEPLOY=1
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --dir) DIR="$2"; shift 2;;
+        --local-port) LOCAL_PORT="$2"; shift 2;;
+        --remote-port) REMOTE_PORT="$2"; shift 2;;
+        --no-deploy) DEPLOY=0; shift;;
+        -h|--help) usage 0;;
+        *) echo "4coder-markers-remote: unknown option $1" >&2; usage;;
+    esac
+done
+case "$HOST" in -*|"") echo "4coder-markers-remote: bad host '$HOST'" >&2; exit 1;; esac
+
+# NOTE: share 4coder's ssh connection to the host (same ControlPath as its ssh layer)
+SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10 -o ControlMaster=auto
+          -o "ControlPath=~/.ssh/4coder-%C" -o ControlPersist=600)
+TUNNEL_SOCKET="$HOME/.ssh/4coder-markers-tunnel-$LOCAL_PORT"
+
+q(){ printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+
+# NOTE: remote SCRIPT [NAME VALUE]...: runs SCRIPT on HOST with DIR (tilde expanded),
+# PORT and the given variables set; stdin goes to the script
+remote(){
+    local script="$1"; shift
+    local vars="DIR=$(q "$DIR"); case \"\$DIR\" in '~'*) DIR=\"\$HOME\${DIR#\\~}\";; esac; PORT=$(q "$REMOTE_PORT");"
+    while [ $# -gt 0 ]; do vars="$vars $1=$(q "$2");"; shift 2; done
+    ssh "${SSH_OPTS[@]}" -- "$HOST" "sh -c $(q "$vars FCODER_MARKERS_PORT=\$PORT; export FCODER_MARKERS_PORT; $script")"
+}
+
+FILES=(Makefile src/4coder_markers.cpp protocol/4coder_agent_markers_protocol.h
+       protocol/4coder_agent_stories_protocol.h README.md AGENT_PROMPT.md)
+
+source_hash(){
+    (cd "$ROOT" && cat "${FILES[@]}") | shasum -a 256 | cut -c1-16
+}
+
+version(){
+    local v
+    v="$(git -C "$ROOT" describe --always --dirty 2>/dev/null || true)"
+    if [ -z "$v" ] && [ -f "$ROOT/VERSION" ]; then v="$(cat "$ROOT/VERSION")"; fi
+    echo "${v:-src}+$(source_hash)"
+}
+
+BUILD_SCRIPT='set -e
+cd "$DIR/.incoming"
+rm -rf build && mkdir build && cd build
+tar xzf ../src.tar.gz
+CXX="${CXX:-c++}"
+command -v "$CXX" >/dev/null 2>&1 || CXX=g++
+command -v "$CXX" >/dev/null 2>&1 || CXX=clang++
+command -v "$CXX" >/dev/null 2>&1 || { echo "deploy: no C++ compiler on $(hostname)" >&2; exit 1; }
+"$CXX" -std=c++11 -O2 -Wall -Wno-unused-function -DFCODER_MARKERS_VERSION="\"$VERSION\"" \
+    src/4coder_markers.cpp -o 4coder-markers
+mkdir -p "$DIR/src" "$DIR/protocol"
+cp src/* "$DIR/src/"; cp protocol/* "$DIR/protocol/"; cp Makefile README.md "$DIR/"
+sed "s|@DIR@|$DIR|g" AGENT_PROMPT.md > "$DIR/AGENT_PROMPT.md"
+# NOTE: rename over the old binary; a running daemon keeps the file it started from
+mv 4coder-markers "$DIR/4coder-markers.new" && mv "$DIR/4coder-markers.new" "$DIR/4coder-markers"
+echo "$HASH" > "$DIR/source.sha256"
+cd "$DIR" && rm -rf .incoming'
+
+# NOTE: restart the daemon when it runs anything but this version
+RESTART_SCRIPT='B="$DIR/4coder-markers"
+running="$("$B" daemon status --state "$DIR" 2>/dev/null || true)"
+case "$running" in
+    *"version $VERSION,"*) ;;
+    running*)
+        "$B" daemon stop --state "$DIR" || { echo "deploy: another service holds port $PORT on $(hostname): $running" >&2; exit 1; }
+        "$B" daemon start --state "$DIR" || exit 1;;
+    *) "$B" daemon start --state "$DIR" || exit 1;;
+esac
+"$B" daemon status --state "$DIR"
+echo "agents use $B (docs $DIR/README.md, prompt $DIR/AGENT_PROMPT.md)"'
+
+deploy(){
+    local hash ver installed
+    hash="$(source_hash)"
+    ver="$(version)"
+    installed="$(remote 'test -x "$DIR/4coder-markers" && cat "$DIR/source.sha256" 2>/dev/null || true')"
+    if [ "$installed" != "$hash" ]; then
+        echo "deploy: building $ver on $HOST"
+        (cd "$ROOT" && tar czf - "${FILES[@]}") |
+            remote 'mkdir -p "$DIR/.incoming" && cat > "$DIR/.incoming/src.tar.gz"'
+        remote "$BUILD_SCRIPT" HASH "$hash" VERSION "$ver"
+    else
+        echo "deploy: $HOST is up to date ($ver)"
+    fi
+    remote "$RESTART_SCRIPT" VERSION "$ver"
+}
+
+tunnel_up(){
+    ssh -S "$TUNNEL_SOCKET" -O check -- "$HOST" >/dev/null 2>&1
+}
+
+connect(){
+    if [ "$DEPLOY" = 1 ]; then deploy; fi
+    if tunnel_up; then
+        echo "connect: 127.0.0.1:$LOCAL_PORT already forwards to $HOST"
+    else
+        if lsof -nP -iTCP:"$LOCAL_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+            echo "connect: something else listens on 127.0.0.1:$LOCAL_PORT here:" >&2
+            lsof -nP -iTCP:"$LOCAL_PORT" -sTCP:LISTEN >&2 || true
+            echo "stop it (for a local service: pkill -f '4coder-markers serve' or 4coder-markers daemon stop)," >&2
+            echo "or pass --local-port P and set agent_markers_port = P in config.4coder" >&2
+            exit 1
+        fi
+        # NOTE: a connection of its own, so the forward outlives 4coder's shared one
+        ssh -f -N -M -S "$TUNNEL_SOCKET" -o BatchMode=yes -o ConnectTimeout=10 \
+            -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+            -L "127.0.0.1:$LOCAL_PORT:127.0.0.1:$REMOTE_PORT" -- "$HOST"
+        echo "connect: 127.0.0.1:$LOCAL_PORT now forwards to $HOST:$REMOTE_PORT"
+    fi
+    local health
+    health="$(curl -s --max-time 3 "http://127.0.0.1:$LOCAL_PORT/v1/health" || true)"
+    if [ -z "$health" ]; then
+        echo "connect: the tunnel is up but nothing answered through it" >&2
+        exit 1
+    fi
+    echo "connect: $health"
+}
+
+case "$CMD" in
+    deploy) deploy;;
+    connect) connect;;
+    disconnect)
+        if tunnel_up; then
+            ssh -S "$TUNNEL_SOCKET" -O exit -- "$HOST" 2>/dev/null
+            echo "disconnect: closed 127.0.0.1:$LOCAL_PORT -> $HOST"
+        else
+            echo "disconnect: no tunnel to $HOST on 127.0.0.1:$LOCAL_PORT"
+        fi;;
+    status)
+        remote 'if [ -x "$DIR/4coder-markers" ]; then "$DIR/4coder-markers" daemon status --state "$DIR"; else echo "not installed in $DIR"; fi' || true
+        if tunnel_up; then echo "tunnel: 127.0.0.1:$LOCAL_PORT -> $HOST:$REMOTE_PORT"; else echo "tunnel: none on 127.0.0.1:$LOCAL_PORT"; fi;;
+    stop)
+        remote '"$DIR/4coder-markers" daemon stop --state "$DIR"';;
+    *) usage;;
+esac
