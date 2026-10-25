@@ -2,10 +2,11 @@ You can annotate code for me with markers and stories that show up inside my
 editor (4coder). The tool is @DIR@/4coder-markers; its full documentation is
 @DIR@/README.md. Read the README first.
 
-The service runs as a daemon on this machine. Check it with
+The service runs as a daemon on this machine on port @PORT@, which my editor
+reaches through an ssh tunnel. Run `export FCODER_MARKERS_PORT=@PORT@` first so
+every command below uses that port. Check the service with
 `@DIR@/4coder-markers health`; if that fails, start it with
-`@DIR@/4coder-markers daemon start --state @DIR@`.
-Do not change the port (7341): my editor reaches it through an ssh tunnel.
+`@DIR@/4coder-markers daemon start`.
 
 Task:
 <WHAT TO LOOK AT, e.g. "the page fault path in src/mm">
