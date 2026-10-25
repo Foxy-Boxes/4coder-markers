@@ -108,8 +108,9 @@ mv 4coder-markers "$DIR/4coder-markers.new" && mv "$DIR/4coder-markers.new" "$DI
 echo "$HASH" > "$DIR/source.sha256"
 cd "$DIR" && rm -rf .incoming'
 
-# NOTE: restart the daemon when it runs anything but this version
+# NOTE: restart the daemon when it runs anything but the installed binary
 RESTART_SCRIPT='B="$DIR/4coder-markers"
+VERSION="$("$B" version | cut -d" " -f2)"
 running="$("$B" daemon status --state "$STATE" 2>/dev/null || true)"
 case "$running" in
     *"version $VERSION,"*) ;;
@@ -134,7 +135,7 @@ deploy(){
     else
         echo "deploy: $HOST is up to date ($ver)"
     fi
-    remote "$RESTART_SCRIPT" VERSION "$ver"
+    remote "$RESTART_SCRIPT"
 }
 
 tunnel_up(){
