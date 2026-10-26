@@ -1,0 +1,10 @@
+{
+  "name": "explain-code",
+  "description": "Explains code in the chat and, at the same time, in 4coder: markers on the important lines and a story you can step through as slides",
+  "version": "1.0.0",
+  "author": {
+    "name": "Foxy-Boxes"
+  },
+  "homepage": "https://github.com/Foxy-Boxes/4coder-markers",
+  "repository": "https://github.com/Foxy-Boxes/4coder-markers"
+}

@@ -88,20 +88,35 @@ Other commands: `list [--file F]`, `rm ID`, `health`. Use `--port P` or
 
 ### The explain-code skill
 
-`skills/explain-code/SKILL.md` is a Claude Code skill: whenever you ask an agent to
-explain code, it posts markers and a story for what it explains and gives the
-explanation in its reply, so the chat, the highlights and the slides agree.
+This repository is a Claude Code plugin marketplace with one plugin,
+`explain-code`. With it, whenever you ask an agent to explain code, it posts markers
+and a story for what it explains and gives the explanation in its reply, so the
+chat, the highlights and the slides agree.
 
-`deploy` writes a copy with the server's paths and port filled in to
-`DIR/skills/explain-code`, and links it into `~/.claude/skills` for the deploying user
-when they use Claude Code. Agents that run as another user link it once
-themselves; later deploys update it through the link:
+In Claude Code, add the marketplace once; the plugin then appears under `/plugin`
+(Discover):
 
-```sh
-mkdir -p ~/.claude/skills && ln -sfn DIR/skills/explain-code ~/.claude/skills/explain-code
+```
+/plugin marketplace add Foxy-Boxes/4coder-markers
+/plugin install explain-code@4coder-markers
 ```
 
-On your own machine, `make install-skill [PORT=P]` installs it.
+or from a shell: `claude plugin marketplace add Foxy-Boxes/4coder-markers && claude
+plugin install explain-code@4coder-markers`. Updates arrive with `/plugin
+marketplace update`.
+
+The skill finds the service through the environment: `FCODER_MARKERS_BIN` (else
+`4coder-markers` on `PATH`, else `~/.4coder-markers/4coder-markers`) and
+`FCODER_MARKERS_PORT` (default 7341). When the daemon is not at the defaults, as on
+a server set up with `deploy`, which prints both values, put them under `"env"` in
+`~/.claude/settings.json`:
+
+```json
+{ "env": { "FCODER_MARKERS_BIN": "/srv/4coder-markers/4coder-markers", "FCODER_MARKERS_PORT": "7342" } }
+```
+
+Without the marketplace, `make install-skill` copies the skill to
+`~/.claude/skills`.
 
 ## HTTP API
 

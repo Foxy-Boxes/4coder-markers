@@ -1,0 +1,17 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "4coder-markers",
+  "description": "Skills for showing agents' explanations of code inside the 4coder editor",
+  "owner": {
+    "name": "Foxy-Boxes"
+  },
+  "plugins": [
+    {
+      "name": "explain-code",
+      "description": "Explains code in the chat and, at the same time, in 4coder: markers on the important lines and a story you can step through as slides",
+      "source": "./plugins/explain-code",
+      "category": "development",
+      "homepage": "https://github.com/Foxy-Boxes/4coder-markers"
+    }
+  ]
+}
