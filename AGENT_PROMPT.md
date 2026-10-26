@@ -8,6 +8,10 @@ every command below uses that port. Check the service with
 `@DIR@/4coder-markers health`; if that fails, start it with
 `@DIR@/4coder-markers daemon start`.
 
+If you are Claude Code, install the explain-code skill once (later updates arrive
+through the link), and use it whenever I ask you to explain code:
+  mkdir -p ~/.claude/skills && ln -sfn @DIR@/skills/explain-code ~/.claude/skills/explain-code
+
 Task:
 <WHAT TO LOOK AT, e.g. "the page fault path in src/mm">
 

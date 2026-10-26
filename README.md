@@ -86,6 +86,23 @@ Rules:
 Other commands: `list [--file F]`, `rm ID`, `health`. Use `--port P` or
 `FCODER_MARKERS_PORT` to change the port.
 
+### The explain-code skill
+
+`skills/explain-code/SKILL.md` is a Claude Code skill: whenever you ask an agent to
+explain code, it posts markers and a story for what it explains and gives the
+explanation in its reply, so the chat, the highlights and the slides agree.
+
+`deploy` writes a copy with the server's paths and port filled in to
+`DIR/skills/explain-code`, and links it into `~/.claude/skills` for the deploying user
+when they use Claude Code. Agents that run as another user link it once
+themselves; later deploys update it through the link:
+
+```sh
+mkdir -p ~/.claude/skills && ln -sfn DIR/skills/explain-code ~/.claude/skills/explain-code
+```
+
+On your own machine, `make install-skill [PORT=P]` installs it.
+
 ## HTTP API
 
 All bodies are JSON. Errors are `{"error": "message"}` with status 400, 404 or 413.
