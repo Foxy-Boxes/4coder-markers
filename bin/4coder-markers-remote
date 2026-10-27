@@ -77,7 +77,8 @@ remote(){
 }
 
 FILES=(Makefile src/4coder_markers.cpp protocol/4coder_agent_markers_protocol.h
-       protocol/4coder_agent_stories_protocol.h README.md AGENT_PROMPT.md)
+       protocol/4coder_agent_stories_protocol.h protocol/4coder_agent_pseudo_protocol.h
+       README.md AGENT_PROMPT.md)
 
 source_hash(){
     (cd "$ROOT" && cat "${FILES[@]}") | shasum -a 256 | cut -c1-16
@@ -128,7 +129,7 @@ case "$running" in
 esac
 "$B" daemon status --state "$STATE"
 echo "for agents (any user): FCODER_MARKERS_BIN=$B FCODER_MARKERS_PORT=$PORT"
-echo "  explain-code skill: claude plugin marketplace add Foxy-Boxes/4coder-markers && claude plugin install explain-code@4coder-markers"
+echo "  skills: claude plugin marketplace add Foxy-Boxes/4coder-markers, then claude plugin install explain-code@4coder-markers and pseudocode@4coder-markers"
 echo "agents use $B on port $PORT (docs $DIR/README.md, prompt $DIR/AGENT_PROMPT.md)"'
 
 deploy(){

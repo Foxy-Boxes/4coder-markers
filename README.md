@@ -11,7 +11,10 @@ the cursor is inside a marked range a popup in the top right of the view shows
 both sentences.
 
 Stories go further: a graph of steps that 4coder presents as slides, walking
-through how the code fits together (see [Stories](#stories)).
+through how the code fits together (see [Stories](#stories)). And the editor can
+send pseudocode to an agent, which implements it and answers with links from the
+pseudocode to the code, presented as a story (see
+[Pseudocode requests](#pseudocode-requests)).
 
 The service is one C++11 file with no dependencies beyond libc. It runs on the
 machine where the agent works, which is often a remote server; a tunnel brings
@@ -86,26 +89,30 @@ Rules:
 Other commands: `list [--file F]`, `rm ID`, `health`. Use `--port P` or
 `FCODER_MARKERS_PORT` to change the port.
 
-### The explain-code skill
+### Skills for Claude Code
 
-This repository is a Claude Code plugin marketplace with one plugin,
-`explain-code`. With it, whenever you ask an agent to explain code, it posts markers
-and a story for what it explains and gives the explanation in its reply, so the
-chat, the highlights and the slides agree.
+This repository is a Claude Code plugin marketplace with two plugins:
 
-In Claude Code, add the marketplace once; the plugin then appears under `/plugin`
+- `explain-code`: whenever you ask an agent to explain code, it posts markers and a
+  story for what it explains and gives the explanation in its reply, so the chat,
+  the highlights and the slides agree.
+- `pseudocode`: its `expand-pseudocode` skill takes pseudocode requests from the
+  editor, implements them and answers with links (see
+  [Pseudocode requests](#pseudocode-requests)).
+
+In Claude Code, add the marketplace once; the plugins then appear under `/plugin`
 (Discover):
 
 ```
 /plugin marketplace add Foxy-Boxes/4coder-markers
 /plugin install explain-code@4coder-markers
+/plugin install pseudocode@4coder-markers
 ```
 
-or from a shell: `claude plugin marketplace add Foxy-Boxes/4coder-markers && claude
-plugin install explain-code@4coder-markers`. Updates arrive with `/plugin
-marketplace update`.
+or from a shell, with `claude plugin marketplace add ...` and `claude plugin install
+...`. Updates arrive with `/plugin marketplace update`.
 
-The skill finds the service through the environment: `FCODER_MARKERS_BIN` (else
+The skills find the service through the environment: `FCODER_MARKERS_BIN` (else
 `4coder-markers` on `PATH`, else `~/.4coder-markers/4coder-markers`) and
 `FCODER_MARKERS_PORT` (default 7341). When the daemon is not at the defaults, as on
 a server set up with `deploy`, which prints both values, put them under `"env"` in
@@ -115,7 +122,7 @@ a server set up with `deploy`, which prints both values, put them under `"env"` 
 { "env": { "FCODER_MARKERS_BIN": "/srv/4coder-markers/4coder-markers", "FCODER_MARKERS_PORT": "7342" } }
 ```
 
-Without the marketplace, `make install-skill` copies the skill to
+Without the marketplace, `make install-skill` copies both skills to
 `~/.claude/skills`.
 
 ## HTTP API
@@ -222,6 +229,69 @@ Other commands: `story list`, `story rm ID`, `story clear [--agent NAME]`.
 Stories have their own revision, separate from the markers' revision. A batch is
 all or nothing, and errors name the story and step at fault.
 
+## Pseudocode requests
+
+The editor records the files you open while writing pseudocode and sends them to
+an agent as a request. The agent writes the code and answers with **links**, each
+pairing a range of pseudocode with the range of code that implements it.
+
+1. In 4coder, `C-x P` starts recording, beginning with the current file.
+2. Open the pseudocode and the files the code belongs in; each one is added.
+   `C-x P` again lists them, and picking one drops it.
+3. `C-x Shift-P` saves them and asks for optional instructions, such as "in C,
+   in cache.c". The request goes to the service, and a badge in the corner shows
+   its state.
+4. An agent on the machine with the files takes it with `4coder-markers pseudo
+   wait`. The `pseudocode` plugin's `expand-pseudocode` skill does the rest:
+   implement, then `pseudo answer`.
+5. The service builds the story `pseudo-ID` from the links. It starts at the
+   request, then goes through each step's pseudocode, then its implementation,
+   both ways. Steps of other stories whose lines overlap the new code (or the
+   pseudocode) get an edge into it, and it gets one back.
+6. The editor reloads the changed files, unless they have unsaved changes, and
+   `C-x N` walks the story.
+
+```sh
+4coder-markers pseudo wait --agent claude          # wait (up to 540 s, exit 4 if none), claim, print
+4coder-markers pseudo check answer.json            # validate an answer
+4coder-markers pseudo answer 7 answer.json --agent claude
+4coder-markers pseudo fail 7 --reason "the files are not on this machine"
+4coder-markers pseudo list [--status pending] | show 7 | cancel 7 | rm 7 | clear
+4coder-markers pseudo request --instructions "..." design.pseudo cache.c   # post one without the editor
+```
+
+An answer:
+
+```json
+{
+  "summary": "Implemented lookup with move-to-front chaining in cache.c.",
+  "changed": ["/abs/cache.c"],
+  "links": [
+    {"title": "Walk the chain, move hits to the front",
+     "text": "A pointer-to-pointer walk unlinks the hit and pushes it at the head.",
+     "pseudo": {"file": "/abs/design.pseudo", "line": 3, "end_line": 4},
+     "code": {"file": "/abs/cache.c", "line": 9, "end_line": 14}}
+  ]
+}
+```
+
+A link needs `pseudo`, `code` or both. Titles are one line of at most 200
+characters, `text` at most 2000, and an answer has at most 120 links. Answering
+again replaces the answer and its story. A request goes from `pending` to
+`claimed` (by one agent; a second claim gets 409), then `done` or `failed`; the
+editor can also cancel it. The service keeps the last 100 requests.
+
+| Method | Path | Body / query | Response |
+|---|---|---|---|
+| `GET` | `/v1/pseudo` | `?since_revision=N`, `?status=S` (both optional) | `{"revision":N,"requests":[...]}`, or `{"revision":N,"unchanged":true}` |
+| `GET` | `/v1/pseudo/ID` | | the request, with `"answer"` once answered |
+| `POST` | `/v1/pseudo` | `{"instructions":"...","files":[{"file":"/abs","host":"user@host"}],"client":"4coder"}` | `{"id":ID,"revision":N}` |
+| `POST` | `/v1/pseudo/ID/claim` | `{"agent":"NAME"}` | the request; 409 unless pending |
+| `POST` | `/v1/pseudo/ID/answer` | an answer, or `{"error":"why"}`; optional `"agent"` | the request; 409 if canceled |
+| `POST` | `/v1/pseudo/ID/cancel` | | the request; 409 if finished |
+| `DELETE` | `/v1/pseudo/ID` | | `{"removed":1,"revision":N}` |
+| `DELETE` | `/v1/pseudo` | | removes finished requests |
+
 ## Running the service
 
 ```sh
@@ -245,6 +315,8 @@ agent_markers_port = 7341;
 | `C-x Shift-M` | `agent_markers_toggle_popup` |
 | `C-x N` | `agent_story_present`: resume the last story, or pick one |
 | `C-x Shift-N` | `agent_story_pick`: pick a story and start from its first step |
+| `C-x P` | `agent_pseudo_record`: record the files to send; again, review them |
+| `C-x Shift-P` | `agent_pseudo_send`: send them as a pseudocode request |
 
 While presenting, the view shows the step's code with a teal highlight and the
 slide at the bottom:
@@ -264,7 +336,8 @@ Other keys keep their usual commands (scrolling, search, switching panels), and
 a presentation stays on its view while you work in another one.
 
 The editor side lives in the 4coder fork that includes this repo as
-`code/marker_service`: `custom/4coder_agent_markers.cpp` and
-`custom/4coder_agent_stories.cpp`, which include the headers in `protocol/`.
+`code/marker_service`: `custom/4coder_agent_markers.cpp`,
+`custom/4coder_agent_stories.cpp` and `custom/4coder_agent_pseudo.cpp`, which include
+the headers in `protocol/`.
 `C-x Shift-R` there runs `4coder-markers-remote connect` for the host of the
 current `/ssh:` buffer.

@@ -1,0 +1,10 @@
+{
+  "name": "pseudocode",
+  "description": "Implements pseudocode sent from the 4coder editor and links every piece of pseudocode to the code that implements it, as a story the editor presents",
+  "version": "1.0.0",
+  "author": {
+    "name": "Foxy-Boxes"
+  },
+  "homepage": "https://github.com/Foxy-Boxes/4coder-markers",
+  "repository": "https://github.com/Foxy-Boxes/4coder-markers"
+}

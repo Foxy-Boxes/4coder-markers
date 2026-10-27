@@ -13,6 +13,7 @@ you to explain code, and make these settings permanent for it (add them to "env"
 ~/.claude/settings.json):
   claude plugin marketplace add Foxy-Boxes/4coder-markers
   claude plugin install explain-code@4coder-markers
+  claude plugin install pseudocode@4coder-markers    # for pseudocode I send from the editor
   FCODER_MARKERS_BIN=@DIR@/4coder-markers   FCODER_MARKERS_PORT=@PORT@
 
 Task:

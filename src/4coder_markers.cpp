@@ -16,6 +16,8 @@ the cursor is on a marked line.
     4coder-markers story post FILE.json|- [--agent NAME]
     4coder-markers story check FILE.json|-
     4coder-markers story list | show ID | rm ID | clear [--agent NAME]
+    4coder-markers pseudo wait | list | show ID | claim ID | check FILE | answer ID FILE | fail ID
+                          | request FILE... | cancel ID | rm ID | clear
 
 Stories (a graph of narrative steps over the code) live next to markers; see
 4coder_agent_stories_protocol.h. The marker API is unchanged by them.
@@ -25,6 +27,7 @@ The HTTP API is documented in README.md next to this file.
 
 #include "../protocol/4coder_agent_markers_protocol.h"
 #include "../protocol/4coder_agent_stories_protocol.h"
+#include "../protocol/4coder_agent_pseudo_protocol.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -113,6 +116,49 @@ story_store_find(const char *id){
     return(0);
 }
 
+// NOTE: requests have their own revision, so the editor's request poller never
+// refetches markers or stories
+struct Pseudo_Store{
+    AM_Pseudo_Job *jobs;
+    int count;
+    int cap;
+    long long next_id;
+    long long revision;
+};
+
+static Pseudo_Store pseudo_store = {0, 0, 0, 1, 1};
+
+#define PSEUDO_KEEP_JOBS 100
+
+static AM_Pseudo_Job*
+pseudo_find(long long id){
+    for (int i = 0; i < pseudo_store.count; i += 1){
+        if (pseudo_store.jobs[i].id == id) return(&pseudo_store.jobs[i]);
+    }
+    return(0);
+}
+
+static void
+pseudo_remove_at(int i){
+    am_pseudo_job_free(&pseudo_store.jobs[i]);
+    memmove(&pseudo_store.jobs[i], &pseudo_store.jobs[i + 1], sizeof(AM_Pseudo_Job)*(pseudo_store.count - i - 1));
+    pseudo_store.count -= 1;
+}
+
+static void
+pseudo_append(AM_Pseudo_Job *j){
+    // NOTE: forget the oldest finished requests; open ones are never dropped
+    for (int i = 0; i < pseudo_store.count && pseudo_store.count >= PSEUDO_KEEP_JOBS;){
+        if (am_pseudo_finished(&pseudo_store.jobs[i])) pseudo_remove_at(i);
+        else i += 1;
+    }
+    if (pseudo_store.count == pseudo_store.cap){
+        pseudo_store.cap = pseudo_store.cap ? pseudo_store.cap*2 : 16;
+        pseudo_store.jobs = (AM_Pseudo_Job*)realloc(pseudo_store.jobs, sizeof(AM_Pseudo_Job)*pseudo_store.cap);
+    }
+    pseudo_store.jobs[pseudo_store.count++] = *j;
+}
+
 static void
 store_save(void){
     if (store.path == 0) return;
@@ -127,6 +173,12 @@ store_save(void){
     for (int i = 0; i < story_store.count; i += 1){
         if (i > 0) am_text_append(&t, ",");
         am_story_to_json(&t, &story_store.stories[i]);
+    }
+    am_text_appendf(&t, "],\"pseudo_next_id\":%lld", pseudo_store.next_id);
+    am_text_appendf(&t, ",\"pseudo_revision\":%lld,\"pseudo\":[", pseudo_store.revision);
+    for (int i = 0; i < pseudo_store.count; i += 1){
+        if (i > 0) am_text_append(&t, ",");
+        am_pseudo_job_to_json(&t, &pseudo_store.jobs[i]);
     }
     am_text_append(&t, "]}\n");
 
@@ -183,6 +235,17 @@ store_load(void){
             char err[256];
             if (am_story_from_json(c, &s, err, sizeof(err)) == 0){
                 story_store_upsert(&s);
+            }
+        }
+        pseudo_store.next_id = am_json_get_int(root, "pseudo_next_id", 1);
+        pseudo_store.revision = am_json_get_int(root, "pseudo_revision", 1);
+        AM_Json *jobs = am_json_get(root, "pseudo");
+        for (AM_Json *c = (jobs && jobs->kind == AMJson_Array) ? jobs->first_child : 0; c != 0; c = c->next){
+            AM_Pseudo_Job j;
+            char err[256];
+            if (am_pseudo_job_from_json(c, &j, err, sizeof(err)) == 0 && j.id > 0){
+                pseudo_append(&j);
+                if (j.id >= pseudo_store.next_id) pseudo_store.next_id = j.id + 1;
             }
         }
     }
@@ -288,7 +351,7 @@ static void
 respond(int fd, int status, AM_Text *json){
     const char *reason = (status == 200) ? "OK" : (status == 400) ? "Bad Request" :
         (status == 404) ? "Not Found" : (status == 405) ? "Method Not Allowed" :
-        (status == 413) ? "Payload Too Large" : "Error";
+        (status == 409) ? "Conflict" : (status == 413) ? "Payload Too Large" : "Error";
     char header[256];
     int n = snprintf(header, sizeof(header),
                      "HTTP/1.1 %d %s\r\nContent-Type: application/json\r\n"
@@ -459,6 +522,441 @@ handle_stories(int fd, Request *req, AM_Text *out){
     return(0);
 }
 
+////////////////////////////////
+// NOTE: pseudocode requests
+
+static void
+pseudo_set_status(AM_Pseudo_Job *j, const char *status){
+    free(j->status);
+    j->status = am_strdup(status);
+    j->updated = (long long)time(0);
+}
+
+// NOTE: a copy of s cut to at most max bytes on a UTF-8 boundary, and to its first line when one_line
+static char*
+clip_dup(const char *s, size_t max, int one_line){
+    size_t n = strlen(s);
+    if (one_line){
+        const char *nl = strchr(s, '\n');
+        if (nl != 0) n = (size_t)(nl - s);
+    }
+    int cut = 0;
+    if (n > max){
+        n = max - 3;
+        while (n > 0 && (s[n] & 0xC0) == 0x80) n -= 1;
+        cut = 1;
+    }
+    char *buf = (char*)malloc(n + 4);
+    memcpy(buf, s, n);
+    memcpy(buf + n, cut ? "..." : "", cut ? 4 : 1);
+    return(buf);
+}
+
+static void
+append_clipped(AM_Text *t, const char *s, size_t max, int one_line){
+    char *c = clip_dup(s, max, one_line);
+    am_json_append_string(t, c);
+    free(c);
+}
+
+static const char*
+path_base(const char *path){
+    const char *slash = strrchr(path, '/');
+    return(slash ? slash + 1 : path);
+}
+
+static void
+append_story_range(AM_Text *t, AM_Pseudo_Range *r){
+    am_text_append(t, ",\"file\":");
+    am_json_append_string(t, r->file);
+    am_text_appendf(t, ",\"line\":%lld", r->line);
+    am_text_appendf(t, ",\"end_line\":%lld", r->end_line);
+}
+
+// NOTE: the first node of link i, starting with its pseudocode
+static void
+append_link_node_id(AM_Text *t, AM_Pseudo_Job *j, int i, int code_first){
+    AM_Pseudo_Link *l = &j->links[i];
+    int code = code_first ? (l->code.file[0] != 0) : (l->pseudo.file[0] == 0);
+    am_text_appendf(t, code ? "\"c%lld\"" : "\"p%lld\"", i + 1);
+}
+
+// NOTE: the story for an answered request: the request, then each link as a pseudocode
+// slide and an implementation slide, linked both ways and to the next link
+static int
+pseudo_build_story(AM_Pseudo_Job *j, AM_Story *out, char *err, size_t err_size){
+    AM_Text t = {};
+    char id[64];
+    snprintf(id, sizeof(id), "pseudo-%lld", j->id);
+    char title[96];
+    snprintf(title, sizeof(title), "Pseudocode #%lld: ", j->id);
+    am_text_append(&t, "{\"id\":");
+    am_json_append_string(&t, id);
+    am_text_append(&t, ",\"title\":");
+    AM_Text full_title = {};
+    am_text_append(&full_title, title);
+    am_text_append(&full_title, j->instructions[0] ? j->instructions : "implementation");
+    append_clipped(&t, full_title.str, AM_STORY_MAX_TITLE, 1);
+    am_text_free(&full_title);
+    am_text_append(&t, ",\"summary\":");
+    append_clipped(&t, j->summary, AM_STORY_MAX_SUMMARY, 0);
+    am_text_append(&t, ",\"agent\":");
+    am_json_append_string(&t, j->agent);
+    am_text_append(&t, ",\"start\":\"request\",\"nodes\":[");
+
+    AM_Text request = {};
+    am_text_append(&request, j->instructions[0] ? j->instructions : "(no instructions)");
+    am_text_append(&request, "\n\n");
+    am_text_append(&request, j->summary);
+    am_text_append(&t, "{\"id\":\"request\",\"kind\":\"request\",\"title\":\"The request and what was done\",\"text\":");
+    append_clipped(&t, request.str, AM_STORY_MAX_TEXT, 0);
+    am_text_free(&request);
+    am_text_append(&t, ",\"next\":[");
+    if (j->link_count > 0){
+        am_text_append(&t, "{\"label\":\"first step\",\"to\":");
+        append_link_node_id(&t, j, 0, 0);
+        am_text_append(&t, "}");
+    }
+    am_text_append(&t, "]}");
+
+    for (int i = 0; i < j->link_count; i += 1){
+        AM_Pseudo_Link *l = &j->links[i];
+        int has_next = (i + 1 < j->link_count);
+        if (l->pseudo.file[0] != 0){
+            am_text_appendf(&t, ",{\"id\":\"p%lld\",\"kind\":\"pseudocode\",\"title\":", i + 1);
+            AM_Text s = {};
+            am_text_append(&s, "Pseudocode: ");
+            am_text_append(&s, l->title);
+            append_clipped(&t, s.str, AM_STORY_MAX_TITLE, 1);
+            am_text_free(&s);
+            append_story_range(&t, &l->pseudo);
+            am_text_append(&t, ",\"text\":");
+            AM_Text text = {};
+            if (l->code.file[0] != 0){
+                char where[512];
+                snprintf(where, sizeof(where), "Implemented in %s, lines %lld-%lld. ",
+                         path_base(l->code.file), l->code.line, l->code.end_line);
+                am_text_append(&text, where);
+            }
+            else{
+                am_text_append(&text, "Not implemented. ");
+            }
+            am_text_append(&text, l->text);
+            append_clipped(&t, text.str, AM_STORY_MAX_TEXT, 0);
+            am_text_free(&text);
+            am_text_append(&t, ",\"next\":[");
+            const char *sep = "";
+            if (l->code.file[0] != 0){
+                am_text_appendf(&t, "{\"to\":\"c%lld\",\"label\":\"implemented by\"}", i + 1);
+                sep = ",";
+            }
+            if (has_next){
+                am_text_append(&t, sep);
+                am_text_append(&t, "{\"label\":\"next pseudocode step\",\"to\":");
+                append_link_node_id(&t, j, i + 1, 0);
+                am_text_append(&t, "}");
+            }
+            am_text_append(&t, "]}");
+        }
+        if (l->code.file[0] != 0){
+            am_text_appendf(&t, ",{\"id\":\"c%lld\",\"kind\":\"code\",\"title\":", i + 1);
+            append_clipped(&t, l->title, AM_STORY_MAX_TITLE, 1);
+            append_story_range(&t, &l->code);
+            am_text_append(&t, ",\"text\":");
+            append_clipped(&t, l->text[0] ? l->text : (l->pseudo.file[0] ? "" : "Added with no pseudocode of its own."), AM_STORY_MAX_TEXT, 0);
+            am_text_append(&t, ",\"next\":[");
+            const char *sep = "";
+            if (has_next){
+                am_text_append(&t, "{\"label\":\"next step\",\"to\":");
+                append_link_node_id(&t, j, i + 1, 1);
+                am_text_append(&t, "}");
+                sep = ",";
+            }
+            if (l->pseudo.file[0] != 0){
+                am_text_append(&t, sep);
+                am_text_appendf(&t, "{\"to\":\"p%lld\",\"label\":\"its pseudocode\"}", i + 1);
+            }
+            am_text_append(&t, "]}");
+        }
+    }
+    am_text_append(&t, "]}");
+
+    AM_Json *root = am_json_parse(t.str, t.size);
+    int ok = (am_story_from_json(root, out, err, err_size) == 0);
+    am_json_free(root);
+    am_text_free(&t);
+    return(ok);
+}
+
+static void
+story_node_add_edge(AM_Story_Node *n, const char *to, const char *story, const char *label){
+    n->next = (AM_Story_Edge*)realloc(n->next, sizeof(AM_Story_Edge)*(n->next_count + 1));
+    AM_Story_Edge *e = &n->next[n->next_count++];
+    e->to = am_strdup(to);
+    e->story = am_strdup(story);
+    e->label = clip_dup(label, AM_STORY_MAX_LABEL, 1);
+}
+
+// NOTE: drops every edge into story_id from the other stories; returns how many
+static int
+stories_unlink(const char *story_id){
+    int removed = 0;
+    for (int s = 0; s < story_store.count; s += 1){
+        AM_Story *story = &story_store.stories[s];
+        for (int i = 0; i < story->node_count; i += 1){
+            AM_Story_Node *n = &story->nodes[i];
+            for (int k = 0; k < n->next_count;){
+                if (str_eq(n->next[k].story, story_id)){
+                    free(n->next[k].to); free(n->next[k].story); free(n->next[k].label);
+                    memmove(&n->next[k], &n->next[k + 1], sizeof(AM_Story_Edge)*(n->next_count - k - 1));
+                    n->next_count -= 1;
+                    removed += 1;
+                }
+                else{
+                    k += 1;
+                }
+            }
+        }
+    }
+    return(removed);
+}
+
+static int
+ranges_overlap(AM_Pseudo_Range *r, AM_Story_Node *n){
+    return(r->file[0] != 0 && n->file[0] != 0 && str_eq(r->file, n->file) &&
+           r->line <= n->end_line && n->line <= r->end_line);
+}
+
+#define PSEUDO_MAX_CROSS_EDGES 2
+
+// NOTE: links the steps of other stories that show the same code (or pseudocode) to the
+// matching slides of ps, and those slides back, while both have room for an edge
+static void
+pseudo_link_stories(AM_Pseudo_Job *j, AM_Story *ps){
+    for (int s = 0; s < story_store.count; s += 1){
+        AM_Story *story = &story_store.stories[s];
+        if (strncmp(story->id, "pseudo-", 7) == 0) continue;
+        for (int i = 0; i < story->node_count; i += 1){
+            AM_Story_Node *n = &story->nodes[i];
+            int added = 0;
+            for (int k = 0; k < j->link_count && added < PSEUDO_MAX_CROSS_EDGES; k += 1){
+                AM_Pseudo_Link *l = &j->links[k];
+                char target[32];
+                const char *label;
+                if (ranges_overlap(&l->code, n)){
+                    snprintf(target, sizeof(target), "c%d", k + 1);
+                    label = "written from pseudocode";
+                }
+                else if (ranges_overlap(&l->pseudo, n)){
+                    snprintf(target, sizeof(target), "p%d", k + 1);
+                    label = "pseudocode for this";
+                }
+                else{
+                    continue;
+                }
+                AM_Story_Node *t = am_story_find_node(ps, target);
+                if (t == 0 || n->next_count >= AM_STORY_MAX_EDGES) break;
+                story_node_add_edge(n, target, ps->id, label);
+                added += 1;
+                if (t->next_count < AM_STORY_MAX_EDGES){
+                    AM_Text back = {};
+                    am_text_append(&back, "in story: ");
+                    am_text_append(&back, story->title);
+                    story_node_add_edge(t, n->id, story->id, back.str);
+                    am_text_free(&back);
+                }
+            }
+        }
+    }
+}
+
+// NOTE: replaces the request's story with one built from its answer
+static int
+pseudo_publish_story(AM_Pseudo_Job *j, char *err, size_t err_size){
+    AM_Story ps;
+    if (!pseudo_build_story(j, &ps, err, err_size)) return(0);
+    stories_unlink(ps.id);
+    pseudo_link_stories(j, &ps);
+    long long now = (long long)time(0);
+    ps.created = now;
+    ps.updated = now;
+    free(j->story);
+    j->story = am_strdup(ps.id);
+    story_store_upsert(&ps);
+    story_store.revision += 1;
+    return(1);
+}
+
+static void
+pseudo_list_json(AM_Text *out, const char *status){
+    am_text_appendf(out, "{\"revision\":%lld,\"requests\":[", pseudo_store.revision);
+    int first = 1;
+    for (int i = 0; i < pseudo_store.count; i += 1){
+        AM_Pseudo_Job *j = &pseudo_store.jobs[i];
+        if (status != 0 && !str_eq(j->status, status)) continue;
+        if (!first) am_text_append(out, ",");
+        first = 0;
+        am_pseudo_job_to_json(out, j);
+    }
+    am_text_append(out, "]}\n");
+}
+
+// NOTE: /v1/pseudo routes; returns whether the store changed
+static int
+handle_pseudo(int fd, Request *req, AM_Text *out){
+    const char *rest = (req->path[10] == '/') ? req->path + 11 : 0;
+    long long id = 0;
+    const char *action = "";
+    if (rest != 0){
+        char *end = 0;
+        id = strtoll(rest, &end, 10);
+        if (id <= 0 || end == rest || (*end != 0 && *end != '/')){
+            respond_error(fd, 404, "no request with that id");
+            return(0);
+        }
+        action = (*end == '/') ? end + 1 : "";
+    }
+    int is_get = (strcmp(req->method, "GET") == 0);
+    int is_post = (strcmp(req->method, "POST") == 0);
+    int is_delete = (strcmp(req->method, "DELETE") == 0);
+    AM_Pseudo_Job *j = (id != 0) ? pseudo_find(id) : 0;
+    if (id != 0 && j == 0){
+        respond_error(fd, 404, "no request with that id");
+        return(0);
+    }
+
+    if (is_get && id == 0){
+        char since[32], status[32];
+        long long since_revision = query_get(req->query, "since_revision", since, sizeof(since)) ? atoll(since) : -1;
+        int has_status = query_get(req->query, "status", status, sizeof(status));
+        if (since_revision == pseudo_store.revision){
+            am_text_appendf(out, "{\"revision\":%lld,\"unchanged\":true}\n", pseudo_store.revision);
+        }
+        else{
+            pseudo_list_json(out, has_status ? status : 0);
+        }
+        respond(fd, 200, out);
+        return(0);
+    }
+    if (is_get && action[0] == 0){
+        am_pseudo_job_to_json(out, j);
+        am_text_append(out, "\n");
+        respond(fd, 200, out);
+        return(0);
+    }
+    if (is_post && id == 0){
+        AM_Json *root = (req->body.str != 0) ? am_json_parse(req->body.str, req->body.size) : 0;
+        AM_Pseudo_Job job;
+        char err[512];
+        if (root == 0){
+            respond_error(fd, 400, "body is not valid JSON");
+            return(0);
+        }
+        if (am_pseudo_request_from_json(root, &job, err, sizeof(err)) != 0){
+            am_json_free(root);
+            respond_error(fd, 400, err);
+            return(0);
+        }
+        am_json_free(root);
+        job.id = pseudo_store.next_id++;
+        pseudo_set_status(&job, "pending");
+        free(job.agent);
+        job.agent = am_strdup(0);
+        job.created = job.updated;
+        pseudo_append(&job);
+        pseudo_store.revision += 1;
+        am_text_appendf(out, "{\"id\":%lld", job.id);
+        am_text_appendf(out, ",\"revision\":%lld}\n", pseudo_store.revision);
+        respond(fd, 200, out);
+        return(1);
+    }
+    if (is_post && (strcmp(action, "claim") == 0 || strcmp(action, "answer") == 0 || strcmp(action, "cancel") == 0)){
+        AM_Json *root = (req->body.str != 0 && req->body.size > 0) ? am_json_parse(req->body.str, req->body.size) : 0;
+        if (req->body.size > 0 && root == 0){
+            respond_error(fd, 400, "body is not valid JSON");
+            return(0);
+        }
+        const char *agent = am_json_get_string(root, "agent");
+        char msg[512];
+        int changed = 0;
+        if (strcmp(action, "claim") == 0){
+            if (!str_eq(j->status, "pending")){
+                snprintf(msg, sizeof(msg), "request %lld is %s%s%s", j->id, j->status, j->agent[0] ? " by " : "", j->agent);
+                respond_error(fd, 409, msg);
+            }
+            else{
+                pseudo_set_status(j, "claimed");
+                free(j->agent);
+                j->agent = am_strdup(agent);
+                changed = 1;
+            }
+        }
+        else if (strcmp(action, "cancel") == 0){
+            if (am_pseudo_finished(j)){
+                snprintf(msg, sizeof(msg), "request %lld is already %s", j->id, j->status);
+                respond_error(fd, 409, msg);
+            }
+            else{
+                pseudo_set_status(j, "canceled");
+                changed = 1;
+            }
+        }
+        else if (str_eq(j->status, "canceled")){
+            snprintf(msg, sizeof(msg), "request %lld was canceled", j->id);
+            respond_error(fd, 409, msg);
+        }
+        else{
+            char err[512];
+            if (am_pseudo_answer_from_json(root, j, err, sizeof(err)) != 0){
+                respond_error(fd, 400, err);
+            }
+            else{
+                if (agent != 0 && agent[0] != 0){
+                    free(j->agent);
+                    j->agent = am_strdup(agent);
+                }
+                int failed = (j->error[0] != 0);
+                if (j->link_count > 0 && !pseudo_publish_story(j, err, sizeof(err))){
+                    // NOTE: the answer was valid, so this is a bug in the story builder
+                    fprintf(stderr, "4coder-markers: story for request %lld: %s\n", j->id, err);
+                }
+                pseudo_set_status(j, failed ? "failed" : "done");
+                changed = 1;
+            }
+        }
+        am_json_free(root);
+        if (changed){
+            pseudo_store.revision += 1;
+            am_pseudo_job_to_json(out, j);
+            am_text_append(out, "\n");
+            respond(fd, 200, out);
+        }
+        return(changed);
+    }
+    if (is_delete){
+        int removed = 0;
+        if (id != 0){
+            for (int i = 0; i < pseudo_store.count; i += 1){
+                if (pseudo_store.jobs[i].id == id){ pseudo_remove_at(i); removed = 1; break; }
+            }
+        }
+        else{
+            // NOTE: clears finished requests; open ones stay
+            for (int i = 0; i < pseudo_store.count;){
+                if (am_pseudo_finished(&pseudo_store.jobs[i])){ pseudo_remove_at(i); removed += 1; }
+                else i += 1;
+            }
+        }
+        if (removed > 0) pseudo_store.revision += 1;
+        am_text_appendf(out, "{\"removed\":%lld", removed);
+        am_text_appendf(out, ",\"revision\":%lld}\n", pseudo_store.revision);
+        respond(fd, 200, out);
+        return(removed > 0);
+    }
+    respond_error(fd, 405, "unknown endpoint or method");
+    return(0);
+}
+
 static void
 handle(int fd, Request *req){
     AM_Text out = {};
@@ -467,7 +965,10 @@ handle(int fd, Request *req){
     if (strcmp(req->path, "/v1/health") == 0){
         am_text_appendf(&out, "{\"ok\":true,\"revision\":%lld", store.revision);
         am_text_appendf(&out, ",\"count\":%lld", store.count);
-        am_text_appendf(&out, ",\"stories\":%lld,\"version\":", story_store.count);
+        am_text_appendf(&out, ",\"stories\":%lld", story_store.count);
+        int pending = 0;
+        for (int i = 0; i < pseudo_store.count; i += 1) pending += str_eq(pseudo_store.jobs[i].status, "pending");
+        am_text_appendf(&out, ",\"pseudo_pending\":%lld,\"version\":", pending);
         am_json_append_string(&out, FCODER_MARKERS_VERSION);
         am_text_append(&out, "}\n");
         respond(fd, 200, &out);
@@ -582,6 +1083,9 @@ handle(int fd, Request *req){
     }
     else if (strncmp(req->path, "/v1/stories", 11) == 0 && (req->path[11] == 0 || req->path[11] == '/')){
         changed = handle_stories(fd, req, &out);
+    }
+    else if (strncmp(req->path, "/v1/pseudo", 10) == 0 && (req->path[10] == 0 || req->path[10] == '/')){
+        changed = handle_pseudo(fd, req, &out);
     }
     else if (strncmp(req->path, "/v1/", 4) == 0){
         respond_error(fd, strncmp(req->path, "/v1/markers", 11) == 0 ? 405 : 404, "unknown endpoint or method");
@@ -891,7 +1395,20 @@ static const char *usage =
 "  4coder-markers story rm ID                             delete one story\n"
 "  4coder-markers story clear [--agent NAME]              delete stories (all if no filter)\n"
 "\n"
-"  Node \"file\" paths are made absolute. See README.md for the story format.\n";
+"  Node \"file\" paths are made absolute. See README.md for the story format.\n"
+"\n"
+"pseudocode requests (the editor sends files with pseudocode; an agent implements them):\n"
+"  4coder-markers pseudo wait [--agent NAME] [--timeout S] [--no-claim]\n"
+"                                     wait for a request (default 540 s, exit 4 on timeout),\n"
+"                                     claim it and print it\n"
+"  4coder-markers pseudo list [--status S] | show ID | claim ID [--agent NAME]\n"
+"  4coder-markers pseudo check FILE.json|-                validate an answer\n"
+"  4coder-markers pseudo answer ID FILE.json|- [--agent NAME]\n"
+"                                     answer with links from pseudocode to code; the service\n"
+"                                     builds story pseudo-ID from them\n"
+"  4coder-markers pseudo fail ID --reason TEXT [--agent NAME]\n"
+"  4coder-markers pseudo request [--instructions TEXT] FILE...   post a request (as the editor does)\n"
+"  4coder-markers pseudo cancel ID | rm ID | clear\n";
 
 static const char *arg_value(int argc, char **argv, const char *name);
 
@@ -1073,6 +1590,302 @@ story_command(int argc, char **argv, AM_Text *out){
     return(result);
 }
 
+static void
+print_range(const char *what, AM_Pseudo_Range *r){
+    if (r->file[0] != 0) printf("%s %s:%lld-%lld", what, r->file, r->line, r->end_line);
+    else printf("%s (none)", what);
+}
+
+static void
+print_pseudo_job(AM_Pseudo_Job *j, int full){
+    printf("#%lld %s", j->id, j->status);
+    if (j->agent[0]) printf(" [%s]", j->agent);
+    printf("  %d file%s", j->file_count, j->file_count == 1 ? "" : "s");
+    if (j->instructions[0]){
+        char *first = clip_dup(j->instructions, 72, 1);
+        printf("  \"%s\"", first);
+        free(first);
+    }
+    printf("\n");
+    if (!full) return;
+    if (j->instructions[0]) printf("  instructions:\n    %s\n", j->instructions);
+    printf("  files:\n");
+    for (int i = 0; i < j->file_count; i += 1){
+        printf("    %s", j->files[i].file);
+        if (j->files[i].host[0]) printf("  (on %s)", j->files[i].host);
+        printf("\n");
+    }
+    if (j->summary[0] || j->error[0]){
+        if (j->error[0]) printf("  error: %s\n", j->error);
+        if (j->summary[0]) printf("  summary: %s\n", j->summary);
+        if (j->story[0]) printf("  story: %s\n", j->story);
+        for (int i = 0; i < j->changed_count; i += 1) printf("  changed: %s\n", j->changed[i]);
+        for (int i = 0; i < j->link_count; i += 1){
+            AM_Pseudo_Link *l = &j->links[i];
+            printf("  %d. %s\n     ", i + 1, l->title);
+            print_range("pseudo", &l->pseudo);
+            printf("\n     ");
+            print_range("code  ", &l->code);
+            printf("\n");
+        }
+    }
+}
+
+// NOTE: parses the service's reply as one job (or the "requests" list) and prints it
+static int
+print_pseudo_reply(AM_Text *out, int full){
+    AM_Json *root = am_json_parse(out->str, out->size);
+    AM_Json *list = am_json_get(root, "requests");
+    int count = 0;
+    AM_Json *c = (list != 0) ? list->first_child : root;
+    for (; c != 0; c = (list != 0) ? c->next : 0){
+        AM_Pseudo_Job j;
+        char err[512];
+        if (am_pseudo_job_from_json(c, &j, err, sizeof(err)) != 0) continue;
+        print_pseudo_job(&j, full);
+        am_pseudo_job_free(&j);
+        count += 1;
+    }
+    am_json_free(root);
+    return(count);
+}
+
+static void
+make_absolute(char **path){
+    char abs_path[PATH_MAX];
+    if ((*path)[0] != 0 && strncmp(*path, "/ssh:", 5) != 0 && realpath(*path, abs_path) != 0){
+        free(*path);
+        *path = am_strdup(abs_path);
+    }
+}
+
+// NOTE: reads an answer from FILE, makes its paths absolute and encodes it into body
+static int
+load_answer(const char *path, const char *agent, AM_Text *body){
+    AM_Text text = {};
+    if (!read_all(path, &text)) return(1);
+    AM_Json *root = am_json_parse(text.str, text.size);
+    AM_Pseudo_Job j = {};
+    j.summary = am_strdup(0); j.error = am_strdup(0); j.story = am_strdup(0);
+    char err[512];
+    int result = 0;
+    if (root == 0){
+        fprintf(stderr, "4coder-markers: %s: not valid JSON\n", path);
+        result = 1;
+    }
+    else if (am_pseudo_answer_from_json(root, &j, err, sizeof(err)) != 0){
+        fprintf(stderr, "4coder-markers: %s: %s\n", path, err);
+        result = 1;
+    }
+    else{
+        for (int i = 0; i < j.changed_count; i += 1) make_absolute(&j.changed[i]);
+        for (int i = 0; i < j.link_count; i += 1){
+            make_absolute(&j.links[i].pseudo.file);
+            make_absolute(&j.links[i].code.file);
+        }
+        AM_Text answer = {};
+        am_pseudo_answer_to_json(&answer, &j);
+        // NOTE: the agent goes in next to the answer's fields
+        am_text_append(body, answer.str, answer.size - 1);
+        am_text_append(body, ",\"agent\":");
+        am_json_append_string(body, agent ? agent : "");
+        am_text_append(body, "}");
+        am_text_free(&answer);
+    }
+    free(j.summary); free(j.error); free(j.story);
+    j.summary = j.error = j.story = 0;
+    am_pseudo_answer_free(&j);
+    free(j.summary); free(j.error); free(j.story);
+    am_json_free(root);
+    am_text_free(&text);
+    return(result);
+}
+
+static int
+pseudo_post(long long id, const char *action, AM_Text *body, AM_Text *out){
+    char path[96];
+    snprintf(path, sizeof(path), "/v1/pseudo/%lld/%s", id, action);
+    AM_Text empty = {};
+    am_text_append(&empty, "{}");
+    int status = call_service("POST", path, body ? body : &empty, out);
+    am_text_free(&empty);
+    return(status);
+}
+
+static void
+agent_body(AM_Text *body, const char *agent){
+    am_text_append(body, "{\"agent\":");
+    am_json_append_string(body, agent ? agent : "");
+    am_text_append(body, "}");
+}
+
+static int
+pseudo_command(int argc, char **argv, AM_Text *out){
+    const char *sub = (argc >= 3) ? argv[2] : "";
+    const char *arg = (argc >= 4) ? argv[3] : 0;
+    const char *agent = arg_value(argc, argv, "--agent");
+    long long id = arg ? atoll(arg) : 0;
+    int result = 0;
+    if (strcmp(sub, "list") == 0){
+        const char *status = arg_value(argc, argv, "--status");
+        AM_Text path = {};
+        am_text_append(&path, "/v1/pseudo");
+        if (status != 0){
+            am_text_append(&path, "?status=");
+            url_encode(&path, status);
+        }
+        result = report(call_service("GET", path.str, 0, out), out);
+        if (result == 0 && print_pseudo_reply(out, 0) == 0) printf("no requests\n");
+        am_text_free(&path);
+    }
+    else if (strcmp(sub, "show") == 0 && id > 0){
+        char path[64];
+        snprintf(path, sizeof(path), "/v1/pseudo/%lld", id);
+        result = report(call_service("GET", path, 0, out), out);
+        if (result == 0) print_pseudo_reply(out, 1);
+    }
+    else if (strcmp(sub, "wait") == 0){
+        const char *timeout_arg = arg_value(argc, argv, "--timeout");
+        long timeout = timeout_arg ? atol(timeout_arg) : 540;
+        int claim = 1;
+        for (int i = 2; i < argc; i += 1) if (strcmp(argv[i], "--no-claim") == 0) claim = 0;
+        time_t until = time(0) + timeout;
+        int warned = 0;
+        result = 4;
+        while (result == 4){
+            AM_Text list = {};
+            int status = am_http_request("127.0.0.1", service_port(), "GET", "/v1/pseudo?status=pending", 0, 0, &list, 2000);
+            if (status != 200 && !warned){
+                fprintf(stderr, "4coder-markers: no service on 127.0.0.1:%d yet (%d); still waiting\n", service_port(), status);
+                warned = 1;
+            }
+            AM_Json *root = (status == 200 && list.str) ? am_json_parse(list.str, list.size) : 0;
+            AM_Json *jobs = am_json_get(root, "requests");
+            for (AM_Json *c = jobs ? jobs->first_child : 0; c != 0 && result == 4; c = c->next){
+                long long jid = am_json_get_int(c, "id", 0);
+                out->size = 0;
+                if (!claim){
+                    char path[64];
+                    snprintf(path, sizeof(path), "/v1/pseudo/%lld", jid);
+                    if (call_service("GET", path, 0, out) == 200) result = 0;
+                    continue;
+                }
+                AM_Text body = {};
+                agent_body(&body, agent);
+                // NOTE: another agent may claim it first (409); try the next one
+                if (pseudo_post(jid, "claim", &body, out) == 200) result = 0;
+                am_text_free(&body);
+            }
+            am_json_free(root);
+            am_text_free(&list);
+            if (result == 0){
+                print_pseudo_reply(out, 1);
+            }
+            else if (time(0) >= until){
+                fprintf(stderr, "4coder-markers: no pseudocode request within %ld seconds\n", timeout);
+                break;
+            }
+            else{
+                sleep(1);
+            }
+        }
+    }
+    else if (strcmp(sub, "claim") == 0 && id > 0){
+        AM_Text body = {};
+        agent_body(&body, agent);
+        result = report(pseudo_post(id, "claim", &body, out), out);
+        if (result == 0) print_pseudo_reply(out, 1);
+        am_text_free(&body);
+    }
+    else if (strcmp(sub, "check") == 0 && arg != 0){
+        AM_Text body = {};
+        result = load_answer(arg, agent, &body);
+        if (result == 0) printf("ok\n");
+        am_text_free(&body);
+    }
+    else if (strcmp(sub, "answer") == 0 && id > 0 && argc >= 5){
+        AM_Text body = {};
+        result = load_answer(argv[4], agent, &body);
+        if (result == 0){
+            result = report(pseudo_post(id, "answer", &body, out), out);
+            if (result == 0){
+                AM_Json *j = am_json_parse(out->str, out->size);
+                AM_Json *answer = am_json_get(j, "answer");
+                AM_Json *links = am_json_get(answer, "links");
+                int n = 0;
+                for (AM_Json *c = links ? links->first_child : 0; c != 0; c = c->next) n += 1;
+                const char *story = am_json_get_string(answer, "story");
+                printf("answered #%lld: %d links", id, n);
+                if (story != 0) printf(", story %s", story);
+                printf("\n");
+                am_json_free(j);
+            }
+        }
+        am_text_free(&body);
+    }
+    else if (strcmp(sub, "fail") == 0 && id > 0){
+        const char *reason = arg_value(argc, argv, "--reason");
+        AM_Text body = {};
+        am_text_append(&body, "{\"error\":");
+        am_json_append_string(&body, reason ? reason : "the agent could not implement this request");
+        am_text_append(&body, ",\"agent\":");
+        am_json_append_string(&body, agent ? agent : "");
+        am_text_append(&body, "}");
+        result = report(pseudo_post(id, "answer", &body, out), out);
+        if (result == 0) printf("request #%lld marked failed\n", id);
+        am_text_free(&body);
+    }
+    else if (strcmp(sub, "cancel") == 0 && id > 0){
+        result = report(pseudo_post(id, "cancel", 0, out), out);
+        if (result == 0) printf("request #%lld canceled\n", id);
+    }
+    else if (strcmp(sub, "rm") == 0 && id > 0){
+        char path[64];
+        snprintf(path, sizeof(path), "/v1/pseudo/%lld", id);
+        result = report(call_service("DELETE", path, 0, out), out);
+        if (result == 0) printf("removed request #%lld\n", id);
+    }
+    else if (strcmp(sub, "clear") == 0){
+        result = report(call_service("DELETE", "/v1/pseudo", 0, out), out);
+        if (result == 0){
+            AM_Json *j = am_json_parse(out->str, out->size);
+            printf("removed %lld finished requests\n", am_json_get_int(j, "removed", 0));
+            am_json_free(j);
+        }
+    }
+    else if (strcmp(sub, "request") == 0){
+        const char *instructions = arg_value(argc, argv, "--instructions");
+        AM_Text body = {};
+        am_text_append(&body, "{\"client\":\"cli\",\"instructions\":");
+        am_json_append_string(&body, instructions ? instructions : "");
+        am_text_append(&body, ",\"files\":[");
+        int count = 0;
+        for (int i = 3; i < argc; i += 1){
+            if (argv[i][0] == '-' && argv[i][1] == '-'){ i += 1; continue; }
+            char *file = am_strdup(argv[i]);
+            make_absolute(&file);
+            if (count++ > 0) am_text_append(&body, ",");
+            am_text_append(&body, "{\"file\":");
+            am_json_append_string(&body, file);
+            am_text_append(&body, "}");
+            free(file);
+        }
+        am_text_append(&body, "]}");
+        result = report(call_service("POST", "/v1/pseudo", &body, out), out);
+        if (result == 0){
+            AM_Json *j = am_json_parse(out->str, out->size);
+            printf("request #%lld posted\n", am_json_get_int(j, "id", 0));
+            am_json_free(j);
+        }
+        am_text_free(&body);
+    }
+    else{
+        fputs(usage, stderr);
+        result = 1;
+    }
+    return(result);
+}
+
 static const char*
 arg_value(int argc, char **argv, const char *name){
     for (int i = 2; i + 1 < argc; i += 1){
@@ -1208,6 +2021,9 @@ main(int argc, char **argv){
     }
     else if (strcmp(cmd, "story") == 0){
         result = story_command(argc, argv, &out);
+    }
+    else if (strcmp(cmd, "pseudo") == 0){
+        result = pseudo_command(argc, argv, &out);
     }
     else if (strcmp(cmd, "health") == 0){
         result = report(call_service("GET", "/v1/health", 0, &out), &out);
